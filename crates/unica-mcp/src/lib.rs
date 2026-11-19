@@ -566,10 +566,10 @@ fn wait_for_task_result(
     cancelled: &CancellationToken,
 ) -> unica_execution_contract::invocation::DomainResult {
     use unica_execution_contract::invocation::InvocationStatus;
-    // Never longer than the host waits for one call; a host that names no
-    // deadline waits more than ten minutes.
-    let until = Instant::now()
-        + unica_bootstrap::host_tool_deadline().unwrap_or(Duration::from_secs(10 * 60));
+    // As long as the host waits for one call. A host that names no deadline
+    // bounds the call itself; letting go earlier would leave the agent a
+    // Task state it cannot read, with the work still running.
+    let until = unica_bootstrap::host_tool_deadline().map(|deadline| Instant::now() + deadline);
     let task_id = snapshot.task_id();
     let mut current = snapshot;
     loop {
@@ -582,7 +582,7 @@ fn wait_for_task_result(
                 CompatibilityProjection::TerminalResult,
             );
         }
-        if cancelled.is_cancelled() || Instant::now() >= until {
+        if cancelled.is_cancelled() || until.is_some_and(|until| Instant::now() >= until) {
             return project_compatibility_snapshot(&current, CompatibilityProjection::State);
         }
         let deadline = FrontendInvocationDeadline::new(Instant::now(), None);
