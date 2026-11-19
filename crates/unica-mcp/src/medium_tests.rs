@@ -320,6 +320,7 @@ fn surface_release_structurally_gates_v12_legacy_dispatch_from_v13_daemon_dispat
         Arc::new(NoopProgressSink),
         deadline,
         false,
+        false,
     )
     .unwrap();
     let SurfaceToolOutcome::Legacy(result) = result else {
@@ -350,6 +351,7 @@ fn surface_release_structurally_gates_v12_legacy_dispatch_from_v13_daemon_dispat
         Arc::new(NoopProgressSink),
         deadline,
         true,
+        false,
     )
     .unwrap();
     let SurfaceToolOutcome::Direct(result) = result else {
@@ -1122,6 +1124,7 @@ fn compatibility_immediate_task_deadline_case(
         CancellationToken::new(),
         Arc::new(NoopProgressSink),
         FrontendInvocationDeadline::new(received, Some(host_budget)),
+        false,
         false,
     )
     .unwrap();

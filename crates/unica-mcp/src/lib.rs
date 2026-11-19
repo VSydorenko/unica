@@ -489,6 +489,7 @@ fn execute_surface_tool(
     progress: Arc<dyn ProgressSink>,
     deadline: FrontendInvocationDeadline,
     client_supports_tasks: bool,
+    waits_for_result: bool,
 ) -> Result<SurfaceToolOutcome, ErrorData> {
     let cancellation = cancellation.into();
     let SurfaceToolCall {
@@ -527,6 +528,7 @@ fn execute_surface_tool(
             let tool = V5ToolIdentity::from_wire_name(name).ok_or_else(|| {
                 ErrorData::invalid_params("tool is not in the canonical v0.13 profile", None)
             })?;
+            let cancelled = cancellation.token();
             match (router.call)(tool, arguments, host, deadline, cancellation)? {
                 CanonicalCallOutcome::Direct(result) => Ok(SurfaceToolOutcome::Direct(result)),
                 CanonicalCallOutcome::Choice { refusal, choice } => {
@@ -534,6 +536,14 @@ fn execute_surface_tool(
                 }
                 CanonicalCallOutcome::Task(snapshot) if client_supports_tasks => {
                     Ok(SurfaceToolOutcome::Task(snapshot))
+                }
+                // LOCAL WORK BUILD (до исправления #3220 в upstream): клиент
+                // 2026-07-28 без Tasks не видит unica.task.*, поэтому вызов
+                // дожидается итога задания и отдаёт его.
+                CanonicalCallOutcome::Task(snapshot) if waits_for_result => {
+                    Ok(SurfaceToolOutcome::Canonical(wait_for_task_result(
+                        router, snapshot, &cancelled,
+                    )))
                 }
                 CanonicalCallOutcome::Task(snapshot) => Ok(SurfaceToolOutcome::Canonical(
                     project_compatibility_snapshot(&snapshot, CompatibilityProjection::State),
@@ -546,6 +556,42 @@ fn execute_surface_tool(
 use crate::application::v13::task_tools::{
     CompatibilityProjection, CompatibilityTaskSnapshot, TaskToolAction, TaskToolError,
 };
+
+/// LOCAL WORK BUILD (#3220): wait in slices of the compatibility wait until
+/// the Task ends, then answer its result as `unica.task.result` would. A
+/// cancelled call stops waiting and answers the Task's state.
+fn wait_for_task_result(
+    router: &CanonicalDaemonRouter,
+    snapshot: V5DaemonTaskSnapshot,
+    cancelled: &CancellationToken,
+) -> unica_execution_contract::invocation::DomainResult {
+    use unica_execution_contract::invocation::InvocationStatus;
+    // Never longer than the host waits for one call; a host that names no
+    // deadline waits more than ten minutes.
+    let until = Instant::now()
+        + unica_bootstrap::host_tool_deadline().unwrap_or(Duration::from_secs(10 * 60));
+    let task_id = snapshot.task_id();
+    let mut current = snapshot;
+    loop {
+        if matches!(
+            current.status(),
+            InvocationStatus::Completed | InvocationStatus::Failed | InvocationStatus::Cancelled
+        ) {
+            return project_compatibility_snapshot(
+                &current,
+                CompatibilityProjection::TerminalResult,
+            );
+        }
+        if cancelled.is_cancelled() || Instant::now() >= until {
+            return project_compatibility_snapshot(&current, CompatibilityProjection::State);
+        }
+        let deadline = FrontendInvocationDeadline::new(Instant::now(), None);
+        match (router.wait)(task_id, 7000, deadline, CanonicalCancellation::default()) {
+            Ok(next) if next.task_id() == task_id => current = next,
+            _ => return project_compatibility_snapshot(&current, CompatibilityProjection::State),
+        }
+    }
+}
 
 enum CompatibilityTaskResult {
     Snapshot(unica_execution_contract::invocation::DomainResult),
@@ -991,7 +1037,9 @@ impl ServerHandler for UnicaServer {
         let (all, modern) = match &self.router {
             SurfaceToolRouter::LegacyV12(_) => (all_tool_definitions(), modern_peer(&context)),
             SurfaceToolRouter::CanonicalV13(_) => {
-                let profile = if native_task_capability(&context) {
+                // LOCAL WORK BUILD (#3220): 2026-07-28 always lists the
+                // eight tools; a call without Tasks waits for its result.
+                let profile = if modern_protocol_authority(&context) {
                     V13TaskProfile::Native
                 } else {
                     V13TaskProfile::Compatibility
@@ -1713,6 +1761,7 @@ async fn invoke_surface_tool(
         received_at,
     } = invocation;
     let client_supports_tasks = native_task_capability(context);
+    let waits_for_result = !client_supports_tasks && modern_protocol_authority(context);
     let admission = server
         .in_flight
         .admit()
@@ -1793,6 +1842,7 @@ async fn invoke_surface_tool(
             progress,
             deadline,
             client_supports_tasks,
+            waits_for_result,
         )
     })
     .await;
